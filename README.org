@@ -1,0 +1,89 @@
+#+TITLE: udjat
+
+=udjat= hosts LLM coding /harnesses/ (=opencode=, =pi=, =Codex=, …) and
+exposes them to clients through one protocol: the
+[[https://agentclientprotocol.com][Agent Client Protocol]] (ACP), later
+carried over =iroh= with a small set of ~_vigil/*~ extensions.
+
+The workspace currently holds one crate:
+
+- ~udjat-harness~: the harness box. For now, a command-line proof of
+  concept that spawns an ACP harness over stdio and lists its sessions.
+
+* Vocabulary
+
+- *harness*: a program that runs LLM sessions (=opencode=, =pi=,
+  =Codex=, =Claude Code=). In ACP terms the harness plays the /agent/
+  role and ~udjat-harness~ plays the /client/ role.
+- *agent*: a persona or role running inside a harness (for example
+  =build= or =plan= in =opencode=). Never used here for a harness.
+- *session*: one conversation run by a harness.
+
+* Installation
+
+#+begin_src sh
+cargo build --release
+# binary: target/release/udjat-harness
+#+end_src
+
+* Usage
+
+List the sessions a harness knows for a directory (default: the current
+directory):
+
+#+begin_src sh
+udjat-harness list-sessions --cwd /work/project
+udjat-harness list-sessions --json --command 'opencode acp'
+#+end_src
+
+The harness command defaults to ~opencode acp~; the
+~UDJAT_HARNESS_COMMAND~ environment variable or ~--command~ overrides it.
+The command is run verbatim; the directory is sent in the ACP
+~session/list~ request. The harness must advertise
+~sessionCapabilities.list~, otherwise the command fails.
+
+Note that ~opencode acp~ starts a complete =opencode= server inside its
+own process, on the data directory and database of the environment it
+runs in.
+
+** Human output
+
+One line per session: session id, last update in local time, title.
+Missing values are shown as ~-~.
+
+#+begin_example
+ses_ebec19bdaffeLaGSxv1hgxroO1  2026-10-15 20:26  New session - 2026-10-15T20:26:10.341Z
+#+end_example
+
+** NDJSON output (~--json~)
+
+One object per session, fields in this order:
+
+| Field     | Type    | Meaning                                       |
+|-----------+---------+-----------------------------------------------|
+| ~updated~ | integer | Last update, UTC seconds since epoch (omitted if unknown) |
+| ~id~      | string  | Session id                                    |
+| ~cwd~     | string  | Session working directory                     |
+| ~title~   | string  | Session title (omitted if unknown)            |
+
+** Logging
+
+~-v~ / ~-vv~ / ~-vvv~ raise the stderr log level; see ~--help~ for
+per-target filters (~-l~), extra outputs (~--log-out~) and
+~--log-time~. Data goes to stdout only.
+
+* Tests
+
+#+begin_src sh
+cargo test
+#+end_src
+
+The integration tests drive the real ~opencode acp~ (found on ~PATH~,
+or set ~UDJAT_TEST_OPENCODE~ to the executable). Every =opencode= process
+they start runs in a cleared environment with a temporary database,
+home and XDG directories, so the tests never touch a real =opencode=
+installation's data.
+
+* License
+
+MIT, see [[file:LICENSE][LICENSE]].
