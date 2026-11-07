@@ -3,3 +3,6 @@ AGENTS.local.md
 CLAUDE.local.md
 .cargo/
 /doc/admin.org
+
+# Verification scripts bound to one machine's data (paths, live ports).
+/scripts/

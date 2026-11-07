@@ -1,0 +1,1022 @@
+// Preserve the reader's pre-extraction control flow and fixture shape.
+#![allow(clippy::collapsible_if)]
+#![cfg_attr(test, allow(clippy::type_complexity))]
+
+use anyhow::Result;
+use chrono::{DateTime, TimeZone, Utc};
+use rusqlite::Connection;
+use serde::Deserialize;
+use serde_json::Value;
+use std::fs;
+use std::path::Path;
+
+use udjat_core::{EntryType, Role, TranscriptEntry};
+
+/// Parse a full conversation transcript from an OpenCode session.
+///
+/// Reads from both file-based storage and SQLite database, merging and
+/// deduplicating entries. If both sources have data, entries are merged
+/// by timestamp+role+content. If only one source has data, that is used.
+pub fn parse_transcript(session_id: &str) -> Result<Vec<TranscriptEntry>> {
+    let storage_dir = crate::opencode_data_dir().join("storage");
+    let file_entries = parse_transcript_from_dir(&storage_dir, session_id);
+    let db_entries = parse_transcript_from_db(session_id);
+
+    match (file_entries, db_entries) {
+        (Ok(fe), Ok(de)) if !fe.is_empty() && !de.is_empty() => {
+            Ok(merge_transcript_entries(fe, de))
+        }
+        (Ok(fe), _) if !fe.is_empty() => Ok(fe),
+        (_, Ok(de)) if !de.is_empty() => Ok(de),
+        (_, Err(db_error)) if super::db::db_exists() => Err(db_error),
+        (Err(file_error), _) => Err(file_error),
+        (Ok(_), Ok(_)) => Ok(Vec::new()),
+        (Ok(_), Err(db_error)) => Err(db_error),
+    }
+}
+
+/// Parse transcript from the SQLite database.
+pub fn parse_transcript_from_db(session_id: &str) -> Result<Vec<TranscriptEntry>> {
+    let conn = super::db::open_db()?;
+    parse_transcript_from_conn(&conn, session_id)
+}
+
+/// Parse transcript from a database connection (testable).
+pub fn parse_transcript_from_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<TranscriptEntry>> {
+    let messages = super::db::get_messages_for_session(conn, session_id)?;
+    if messages.is_empty() {
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session WHERE id = ?)",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if exists {
+            anyhow::bail!("OpenCode session has no messages: {}", session_id);
+        }
+        anyhow::bail!(
+            "OpenCode session not found: {}; check that the session ID is complete and exact",
+            session_id
+        );
+    }
+
+    let messages = messages
+        .into_iter()
+        .map(|(id, info)| {
+            Ok(crate::MessageWithParts {
+                info,
+                parts: super::db::get_parts_for_message(conn, &id)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(parse_transcript_from_messages(&messages))
+}
+
+/// Pure converter shared by database and V1 HTTP readers.
+pub fn parse_transcript_from_messages(
+    messages: &[crate::MessageWithParts],
+) -> Vec<TranscriptEntry> {
+    let mut entries = Vec::new();
+    for message in messages {
+        let data = &message.info;
+        let role = match data
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+        {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "system" => Role::System,
+            _ => continue,
+        };
+
+        let time_created_ms = data
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let msg_timestamp = Utc
+            .timestamp_millis_opt(time_created_ms)
+            .single()
+            .unwrap_or_else(Utc::now);
+
+        // Check for message-level error (e.g. API validation errors)
+        if let Some(error) = data.get("error") {
+            if let Some(msg) = extract_error_message(error) {
+                entries.push(TranscriptEntry {
+                    timestamp: msg_timestamp,
+                    role: role.clone(),
+                    entry_type: EntryType::Error,
+                    content: msg,
+                    tool_name: None,
+                    tool_input: None,
+                });
+            }
+        }
+
+        for part in &message.parts {
+            entries_from_part(part, &role, msg_timestamp, &mut entries);
+        }
+    }
+
+    entries.sort_by_key(|e| e.timestamp);
+    entries
+}
+
+/// Extract an error message from a message-level `"error"` field.
+///
+/// OpenCode stores API errors (e.g. image too large, rate limits) on the
+/// message itself, not in parts. Structure: `error.data.message` with
+/// fallback to `error.name`.
+fn extract_error_message(error: &Value) -> Option<String> {
+    error
+        .get("data")
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| error.get("name").and_then(|n| n.as_str()))
+        .map(|s| s.to_string())
+}
+
+/// Convert a part JSON value into transcript entries.
+///
+/// Shared logic used by both file-based and DB-based parsing.
+fn entries_from_part(
+    part: &Value,
+    role: &Role,
+    msg_timestamp: DateTime<Utc>,
+    entries: &mut Vec<TranscriptEntry>,
+) {
+    let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Get part timestamp if available, otherwise use message timestamp
+    let part_timestamp = part
+        .get("time")
+        .and_then(|t| t.get("start"))
+        .and_then(|v| v.as_i64())
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+        .unwrap_or(msg_timestamp);
+
+    match part_type {
+        "text" => {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                if !text.trim().is_empty() {
+                    entries.push(TranscriptEntry {
+                        timestamp: part_timestamp,
+                        role: role.clone(),
+                        entry_type: EntryType::Text,
+                        content: text.to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                    });
+                }
+            }
+        }
+        "tool" => {
+            let tool_name = part
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let state = part.get("state");
+            let input = state.and_then(|s| s.get("input")).cloned();
+            let status = state
+                .and_then(|s| s.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let output = state
+                .and_then(|s| s.get("output"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let error = state
+                .and_then(|s| s.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // ToolUse entry
+            entries.push(TranscriptEntry {
+                timestamp: part_timestamp,
+                role: role.clone(),
+                entry_type: EntryType::ToolUse,
+                content: String::new(),
+                tool_name: Some(tool_name),
+                tool_input: input,
+            });
+
+            // ToolResult / ToolError entry (use end time if available).
+            // `state.status == "error"` covers user-dismissed `question`
+            // tool calls, aborted tool executions, and tool-side failures.
+            // We surface `state.error` (the actual failure message) instead
+            // of `state.output` (typically empty for errored parts).
+            let result_timestamp = part
+                .get("time")
+                .and_then(|t| t.get("end"))
+                .and_then(|v| v.as_i64())
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+                .unwrap_or(part_timestamp);
+
+            let (entry_type, content) = if status == "error" {
+                // Prefer state.error; fall back to state.output if error is empty.
+                let msg = if !error.is_empty() { error } else { output };
+                (EntryType::ToolError, msg)
+            } else {
+                (EntryType::ToolResult, output)
+            };
+
+            entries.push(TranscriptEntry {
+                timestamp: result_timestamp,
+                role: role.clone(),
+                entry_type,
+                content,
+                tool_name: None,
+                tool_input: None,
+            });
+        }
+        "reasoning" => {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                if !text.trim().is_empty() {
+                    entries.push(TranscriptEntry {
+                        timestamp: part_timestamp,
+                        role: role.clone(),
+                        entry_type: EntryType::Thinking,
+                        content: text.to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                    });
+                }
+            }
+        }
+        // Skip internal metadata types
+        "step-start" | "step-finish" | "compaction" => {}
+        _ => {}
+    }
+}
+
+/// Merge transcript entries from file and DB sources, deduplicating by
+/// timestamp + role + entry_type + content. DB entries win on conflict.
+fn merge_transcript_entries(
+    file_entries: Vec<TranscriptEntry>,
+    db_entries: Vec<TranscriptEntry>,
+) -> Vec<TranscriptEntry> {
+    udjat_core::merge_transcripts(db_entries, file_entries)
+}
+
+pub fn parse_transcript_from_dir(
+    storage_dir: &Path,
+    session_id: &str,
+) -> Result<Vec<TranscriptEntry>> {
+    let message_dir = storage_dir.join("message").join(session_id);
+    let part_dir = storage_dir.join("part");
+
+    if !message_dir.exists() {
+        anyhow::bail!("No messages found for session: {}", session_id);
+    }
+
+    // Collect and sort message files alphabetically (IDs are chronologically sortable)
+    let mut msg_files: Vec<_> = fs::read_dir(&message_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    msg_files.sort_by_key(|e| e.file_name());
+
+    let mut entries = Vec::new();
+
+    for msg_entry in &msg_files {
+        let msg_path = msg_entry.path();
+        let content = match fs::read_to_string(&msg_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let message: MessageMeta = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let role = match message.role.as_deref() {
+            Some("user") => Role::User,
+            Some("assistant") => Role::Assistant,
+            Some("system") => Role::System,
+            _ => continue,
+        };
+
+        let msg_timestamp = Utc
+            .timestamp_millis_opt(message.time.created)
+            .single()
+            .unwrap_or_else(Utc::now);
+
+        // Check for message-level error (e.g. API validation errors)
+        if let Some(error) = &message.error {
+            if let Some(msg) = extract_error_message(error) {
+                entries.push(TranscriptEntry {
+                    timestamp: msg_timestamp,
+                    role: role.clone(),
+                    entry_type: EntryType::Error,
+                    content: msg,
+                    tool_name: None,
+                    tool_input: None,
+                });
+            }
+        }
+
+        // Read parts for this message
+        let msg_part_dir = part_dir.join(&message.id);
+        if !msg_part_dir.exists() {
+            continue;
+        }
+
+        let mut part_files: Vec<_> = fs::read_dir(&msg_part_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        part_files.sort_by_key(|e| e.file_name());
+
+        for part_entry in &part_files {
+            let part_path = part_entry.path();
+            let part_content = match fs::read_to_string(&part_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let part: Value = match serde_json::from_str(&part_content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            entries_from_part(&part, &role, msg_timestamp, &mut entries);
+        }
+    }
+
+    // Already sorted by message/part file order, but ensure timestamp ordering
+    entries.sort_by_key(|e| e.timestamp);
+    Ok(entries)
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageMeta {
+    id: String,
+    role: Option<String>,
+    time: TimeMeta,
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimeMeta {
+    created: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Create minimal OpenCode storage for testing.
+    fn create_test_storage(
+        base: &Path,
+        session_id: &str,
+        messages: &[(&str, &str, i64, &[(&str, &str)])],
+        // (msg_id, role, timestamp_ms, parts: [(part_id, part_json)])
+    ) {
+        let message_dir = base.join("message").join(session_id);
+        let part_dir = base.join("part");
+        fs::create_dir_all(&message_dir).unwrap();
+
+        for (msg_id, role, ts, parts) in messages {
+            let msg_json = format!(
+                r#"{{"id":"{}","sessionID":"{}","role":"{}","time":{{"created":{}}}}}"#,
+                msg_id, session_id, role, ts
+            );
+            fs::write(message_dir.join(format!("{}.json", msg_id)), msg_json).unwrap();
+
+            let msg_part_dir = part_dir.join(msg_id);
+            fs::create_dir_all(&msg_part_dir).unwrap();
+
+            for (part_id, part_json) in *parts {
+                fs::write(msg_part_dir.join(format!("{}.json", part_id)), part_json).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_text_part() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        create_test_storage(
+            storage,
+            "ses_test1",
+            &[(
+                "msg_001",
+                "user",
+                1705314600000,
+                &[(
+                    "prt_001",
+                    r#"{"id":"prt_001","sessionID":"ses_test1","messageID":"msg_001","type":"text","text":"Hello world"}"#,
+                )],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_test1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].role, Role::User));
+        assert!(matches!(entries[0].entry_type, EntryType::Text));
+        assert_eq!(entries[0].content, "Hello world");
+    }
+
+    #[test]
+    fn test_parse_tool_part() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let tool_json = r#"{
+            "id": "prt_002",
+            "sessionID": "ses_test1",
+            "messageID": "msg_002",
+            "type": "tool",
+            "tool": "Bash",
+            "state": {
+                "status": "completed",
+                "input": {"command": "ls"},
+                "output": "file1.txt\nfile2.txt",
+                "time": {"start": 1705314601000, "end": 1705314602000}
+            },
+            "time": {"start": 1705314601000, "end": 1705314602000}
+        }"#;
+
+        create_test_storage(
+            storage,
+            "ses_test1",
+            &[(
+                "msg_002",
+                "assistant",
+                1705314601000,
+                &[("prt_002", tool_json)],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_test1").unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // First: ToolUse
+        assert!(matches!(entries[0].entry_type, EntryType::ToolUse));
+        assert_eq!(entries[0].tool_name.as_deref(), Some("Bash"));
+        assert!(entries[0].tool_input.is_some());
+
+        // Second: ToolResult
+        assert!(matches!(entries[1].entry_type, EntryType::ToolResult));
+        assert_eq!(entries[1].content, "file1.txt\nfile2.txt");
+    }
+
+    #[test]
+    fn test_parse_tool_part_error_status_emits_tool_error() {
+        // Real OpenCode shape: user dismissed a `question` MCP tool call.
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let tool_json = r#"{
+            "id": "prt_err",
+            "sessionID": "ses_test_err",
+            "messageID": "msg_err",
+            "type": "tool",
+            "tool": "question",
+            "state": {
+                "status": "error",
+                "input": {"questions": [{"header": "Test", "question": "?"}]},
+                "error": "Error: The user dismissed this question",
+                "time": {"start": 1705314601000, "end": 1705314602000}
+            },
+            "time": {"start": 1705314601000, "end": 1705314602000}
+        }"#;
+
+        create_test_storage(
+            storage,
+            "ses_test_err",
+            &[(
+                "msg_err",
+                "assistant",
+                1705314601000,
+                &[("prt_err", tool_json)],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_test_err").unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // ToolUse still emitted for the question call
+        assert!(matches!(entries[0].entry_type, EntryType::ToolUse));
+        assert_eq!(entries[0].tool_name.as_deref(), Some("question"));
+
+        // ToolError carries the state.error string, NOT empty state.output
+        assert!(matches!(entries[1].entry_type, EntryType::ToolError));
+        assert_eq!(
+            entries[1].content,
+            "Error: The user dismissed this question"
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_part_error_falls_back_to_output_when_error_empty() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let tool_json = r#"{
+            "id": "prt_fb",
+            "sessionID": "ses_fb",
+            "messageID": "msg_fb",
+            "type": "tool",
+            "tool": "bash",
+            "state": {
+                "status": "error",
+                "input": {"command": "false"},
+                "output": "exit code 1",
+                "time": {"start": 1705314601000, "end": 1705314602000}
+            },
+            "time": {"start": 1705314601000, "end": 1705314602000}
+        }"#;
+
+        create_test_storage(
+            storage,
+            "ses_fb",
+            &[(
+                "msg_fb",
+                "assistant",
+                1705314601000,
+                &[("prt_fb", tool_json)],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_fb").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[1].entry_type, EntryType::ToolError));
+        assert_eq!(entries[1].content, "exit code 1");
+    }
+
+    #[test]
+    fn test_parse_reasoning_part() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        let reasoning_json = r#"{
+            "id": "prt_003",
+            "sessionID": "ses_test1",
+            "messageID": "msg_003",
+            "type": "reasoning",
+            "text": "Let me think about this...",
+            "time": {"start": 1705314603000, "end": 1705314604000}
+        }"#;
+
+        create_test_storage(
+            storage,
+            "ses_test1",
+            &[(
+                "msg_003",
+                "assistant",
+                1705314603000,
+                &[("prt_003", reasoning_json)],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_test1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Thinking));
+        assert_eq!(entries[0].content, "Let me think about this...");
+    }
+
+    #[test]
+    fn test_skip_step_parts() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        create_test_storage(
+            storage,
+            "ses_test1",
+            &[(
+                "msg_004",
+                "assistant",
+                1705314605000,
+                &[
+                    (
+                        "prt_001",
+                        r#"{"id":"prt_001","sessionID":"ses_test1","messageID":"msg_004","type":"step-start","snapshot":"abc"}"#,
+                    ),
+                    (
+                        "prt_002",
+                        r#"{"id":"prt_002","sessionID":"ses_test1","messageID":"msg_004","type":"text","text":"Actual content"}"#,
+                    ),
+                    (
+                        "prt_003",
+                        r#"{"id":"prt_003","sessionID":"ses_test1","messageID":"msg_004","type":"step-finish","reason":"done"}"#,
+                    ),
+                ],
+            )],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_test1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "Actual content");
+    }
+
+    #[test]
+    fn test_ordering() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        create_test_storage(
+            storage,
+            "ses_test1",
+            &[
+                (
+                    "msg_002",
+                    "assistant",
+                    1705314601000,
+                    &[(
+                        "prt_001",
+                        r#"{"id":"prt_001","sessionID":"ses_test1","messageID":"msg_002","type":"text","text":"Response"}"#,
+                    )],
+                ),
+                (
+                    "msg_001",
+                    "user",
+                    1705314600000,
+                    &[(
+                        "prt_001",
+                        r#"{"id":"prt_001","sessionID":"ses_test1","messageID":"msg_001","type":"text","text":"Question"}"#,
+                    )],
+                ),
+            ],
+        );
+
+        let entries = parse_transcript_from_dir(storage, "ses_test1").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].timestamp < entries[1].timestamp);
+        assert_eq!(entries[0].content, "Question");
+        assert_eq!(entries[1].content, "Response");
+    }
+
+    // --- DB-based transcript tests ---
+
+    fn setup_transcript_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::create_schema(&conn).unwrap();
+        conn
+    }
+
+    fn insert_msg(conn: &rusqlite::Connection, id: &str, session_id: &str, role: &str, ts: i64) {
+        let data = format!(r#"{{"role":"{}","time":{{"created":{}}}}}"#, role, ts);
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, ts, ts, data],
+        ).unwrap();
+    }
+
+    fn insert_prt(
+        conn: &rusqlite::Connection,
+        id: &str,
+        msg_id: &str,
+        session_id: &str,
+        ts: i64,
+        data: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, msg_id, session_id, ts, ts, data],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_text() {
+        let conn = setup_transcript_db();
+        insert_msg(&conn, "msg_001", "ses_db1", "user", 1705314600000);
+        insert_prt(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db1",
+            1705314600000,
+            r#"{"type":"text","text":"Hello from DB"}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_db1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].role, Role::User));
+        assert!(matches!(entries[0].entry_type, EntryType::Text));
+        assert_eq!(entries[0].content, "Hello from DB");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_tool() {
+        let conn = setup_transcript_db();
+        insert_msg(&conn, "msg_001", "ses_db2", "assistant", 1705314601000);
+        insert_prt(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db2",
+            1705314601000,
+            r#"{"type":"tool","tool":"Bash","state":{"input":{"command":"ls"},"output":"file.txt"},"time":{"start":1705314601000,"end":1705314602000}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_db2").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].entry_type, EntryType::ToolUse));
+        assert_eq!(entries[0].tool_name.as_deref(), Some("Bash"));
+        assert!(matches!(entries[1].entry_type, EntryType::ToolResult));
+        assert_eq!(entries[1].content, "file.txt");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_tool_error_status() {
+        // DB-based equivalent of the file-based dismissed-question test.
+        let conn = setup_transcript_db();
+        insert_msg(&conn, "msg_001", "ses_db_err", "assistant", 1705314601000);
+        insert_prt(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db_err",
+            1705314601000,
+            r#"{"type":"tool","tool":"question","state":{"status":"error","input":{"questions":[]},"error":"Error: The user dismissed this question"},"time":{"start":1705314601000,"end":1705314602000}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_db_err").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].entry_type, EntryType::ToolUse));
+        assert!(matches!(entries[1].entry_type, EntryType::ToolError));
+        assert_eq!(
+            entries[1].content,
+            "Error: The user dismissed this question"
+        );
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_reasoning() {
+        let conn = setup_transcript_db();
+        insert_msg(&conn, "msg_001", "ses_db3", "assistant", 1705314603000);
+        insert_prt(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db3",
+            1705314603000,
+            r#"{"type":"reasoning","text":"Thinking deeply...","time":{"start":1705314603000}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_db3").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Thinking));
+        assert_eq!(entries[0].content, "Thinking deeply...");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_skips_step_parts() {
+        let conn = setup_transcript_db();
+        insert_msg(&conn, "msg_001", "ses_db4", "assistant", 1705314605000);
+        insert_prt(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db4",
+            1705314605000,
+            r#"{"type":"step-start","snapshot":"abc"}"#,
+        );
+        insert_prt(
+            &conn,
+            "prt_002",
+            "msg_001",
+            "ses_db4",
+            1705314605100,
+            r#"{"type":"text","text":"Actual content"}"#,
+        );
+        insert_prt(
+            &conn,
+            "prt_003",
+            "msg_001",
+            "ses_db4",
+            1705314605200,
+            r#"{"type":"step-finish","reason":"done"}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_db4").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "Actual content");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_ordering() {
+        let conn = setup_transcript_db();
+        // Insert in reverse order — should still be sorted by timestamp
+        insert_msg(&conn, "msg_002", "ses_db5", "assistant", 1705314601000);
+        insert_msg(&conn, "msg_001", "ses_db5", "user", 1705314600000);
+        insert_prt(
+            &conn,
+            "prt_002",
+            "msg_002",
+            "ses_db5",
+            1705314601000,
+            r#"{"type":"text","text":"Response"}"#,
+        );
+        insert_prt(
+            &conn,
+            "prt_001",
+            "msg_001",
+            "ses_db5",
+            1705314600000,
+            r#"{"type":"text","text":"Question"}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_db5").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].timestamp < entries[1].timestamp);
+        assert_eq!(entries[0].content, "Question");
+        assert_eq!(entries[1].content, "Response");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_empty_session() {
+        let conn = setup_transcript_db();
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated) \
+             VALUES (?1, 'project', NULL, '/project', '', 1, 1)",
+            ["ses_empty"],
+        )
+        .unwrap();
+
+        let error = parse_transcript_from_conn(&conn, "ses_empty").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OpenCode session has no messages: ses_empty"
+        );
+    }
+
+    fn insert_msg_with_data(
+        conn: &rusqlite::Connection,
+        id: &str,
+        session_id: &str,
+        ts: i64,
+        data: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, session_id, ts, ts, data],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_message_error() {
+        let conn = setup_transcript_db();
+        insert_msg_with_data(
+            &conn,
+            "msg_001",
+            "ses_err1",
+            1705314600000,
+            r#"{"role":"assistant","time":{"created":1705314600000},"error":{"name":"APIError","data":{"message":"image too large","statusCode":400}}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_err1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Error));
+        assert!(matches!(entries[0].role, Role::Assistant));
+        assert_eq!(entries[0].content, "image too large");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_db_message_error_name_fallback() {
+        let conn = setup_transcript_db();
+        insert_msg_with_data(
+            &conn,
+            "msg_001",
+            "ses_err2",
+            1705314600000,
+            r#"{"role":"assistant","time":{"created":1705314600000},"error":{"name":"RateLimitError"}}"#,
+        );
+
+        let entries = parse_transcript_from_conn(&conn, "ses_err2").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Error));
+        assert_eq!(entries[0].content, "RateLimitError");
+    }
+
+    #[test]
+    fn test_parse_transcript_from_dir_message_error() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path();
+
+        // Create message dir and file with error, but no part dir
+        let session_id = "ses_err_file";
+        let message_dir = storage.join("message").join(session_id);
+        fs::create_dir_all(&message_dir).unwrap();
+
+        let msg_json = r#"{"id":"msg_001","role":"assistant","time":{"created":1705314600000},"error":{"name":"APIError","data":{"message":"image dimension exceeds 8000 pixels","statusCode":400}}}"#;
+        fs::write(message_dir.join("msg_001.json"), msg_json).unwrap();
+
+        let entries = parse_transcript_from_dir(storage, session_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].entry_type, EntryType::Error));
+        assert!(matches!(entries[0].role, Role::Assistant));
+        assert_eq!(entries[0].content, "image dimension exceeds 8000 pixels");
+    }
+
+    // --- Merge tests ---
+
+    #[test]
+    fn test_merge_transcript_entries_dedup() {
+        let ts = Utc.timestamp_millis_opt(1705314600000).unwrap();
+
+        let file_entries = vec![TranscriptEntry {
+            timestamp: ts,
+            role: Role::User,
+            entry_type: EntryType::Text,
+            content: "Hello".to_string(),
+            tool_name: None,
+            tool_input: None,
+        }];
+
+        let db_entries = vec![TranscriptEntry {
+            timestamp: ts,
+            role: Role::User,
+            entry_type: EntryType::Text,
+            content: "Hello".to_string(),
+            tool_name: None,
+            tool_input: None,
+        }];
+
+        let merged = merge_transcript_entries(file_entries, db_entries);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].content, "Hello");
+    }
+
+    #[test]
+    fn test_merge_transcript_entries_combines_unique() {
+        let ts1 = Utc.timestamp_millis_opt(1705314600000).unwrap();
+        let ts2 = Utc.timestamp_millis_opt(1705314601000).unwrap();
+
+        let file_entries = vec![TranscriptEntry {
+            timestamp: ts1,
+            role: Role::User,
+            entry_type: EntryType::Text,
+            content: "From files only".to_string(),
+            tool_name: None,
+            tool_input: None,
+        }];
+
+        let db_entries = vec![TranscriptEntry {
+            timestamp: ts2,
+            role: Role::Assistant,
+            entry_type: EntryType::Text,
+            content: "From DB only".to_string(),
+            tool_name: None,
+            tool_input: None,
+        }];
+
+        let merged = merge_transcript_entries(file_entries, db_entries);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].content, "From files only");
+        assert_eq!(merged[1].content, "From DB only");
+    }
+
+    #[test]
+    fn test_merge_transcript_entries_db_wins_on_conflict() {
+        let ts = Utc.timestamp_millis_opt(1705314600000).unwrap();
+
+        // Same timestamp+role+type+content = duplicate, DB version kept
+        let file_entries = vec![
+            TranscriptEntry {
+                timestamp: ts,
+                role: Role::User,
+                entry_type: EntryType::Text,
+                content: "Same content".to_string(),
+                tool_name: None,
+                tool_input: None,
+            },
+            TranscriptEntry {
+                timestamp: ts,
+                role: Role::User,
+                entry_type: EntryType::Text,
+                content: "File-only extra".to_string(),
+                tool_name: None,
+                tool_input: None,
+            },
+        ];
+
+        let db_entries = vec![TranscriptEntry {
+            timestamp: ts,
+            role: Role::User,
+            entry_type: EntryType::Text,
+            content: "Same content".to_string(),
+            tool_name: None,
+            tool_input: None,
+        }];
+
+        let merged = merge_transcript_entries(file_entries, db_entries);
+        assert_eq!(merged.len(), 2);
+        // "Same content" appears once (from DB), "File-only extra" also present
+        let contents: Vec<&str> = merged.iter().map(|e| e.content.as_str()).collect();
+        assert!(contents.contains(&"Same content"));
+        assert!(contents.contains(&"File-only extra"));
+    }
+}

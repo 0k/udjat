@@ -1,0 +1,18 @@
+[package]
+name = "udjat-fanout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+udjat-core.workspace = true
+
+[dev-dependencies]
+udjat-archive-opencode.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+indoc.workspace = true

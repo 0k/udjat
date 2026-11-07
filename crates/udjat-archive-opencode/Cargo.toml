@@ -1,0 +1,23 @@
+[package]
+name = "udjat-archive-opencode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read-only OpenCode SQLite and legacy session archive"
+
+[dependencies]
+udjat-core.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+log.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+indoc.workspace = true
