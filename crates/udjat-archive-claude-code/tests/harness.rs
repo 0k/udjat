@@ -14,6 +14,11 @@ fn reads_fixture_through_harness() {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, ID);
             assert_eq!(sessions[0].project_dir, "/fixture");
+            assert_eq!(Harness::messages(&archive,ID,Default::default()).await.unwrap().messages.len(),1);
+            assert_eq!(Harness::session_row(&archive,ID).await.unwrap().unwrap().status.last_user_message_text.as_deref(),Some("hello fixture"));
+            assert!(Harness::session_row(&archive,"missing").await.unwrap().is_none());
+            assert!(Harness::children(&archive,ID).await.unwrap().is_empty());
+            assert_eq!(Harness::list_rows(&archive,&Default::default()).await.unwrap().len(),1);
             let entries = Harness::transcript(&archive, ID).await.unwrap();
             assert_eq!(serde_json::to_value(entries).unwrap(), serde_json::json!([
                 {"timestamp":"2026-01-01T00:00:00Z","role":"user","entry_type":"text","content":"hello fixture"}

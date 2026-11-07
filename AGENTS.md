@@ -28,12 +28,16 @@ box binary.
 - `Cargo.toml`: workspace; every external dependency is declared once
   in `[workspace.dependencies]` and used with `x.workspace = true`.
 - `crates/udjat-core`: udjat's session model (`Session`, `Message`,
-  `TranscriptEntry`, …), `HarnessKind`, and the async `Harness` trait
-  with its `Capability` groups. No I/O.
+  `MessageRecord`, `MessageInfo`, typed `PartKind` and `ToolState`),
+  lossless OpenCode V1 projections, `SessionRow` / `StructuralStatus`,
+  the flat `TranscriptEntry` projection, cursor pages, `HarnessKind`,
+  and the async `Harness` trait with its `Capability` groups. No I/O.
 - `crates/udjat-archive-{claude-code,opencode,pi}`: in-process,
   read-only readers of each harness's session files and database, moved
   from ai-audit. Each implements `Harness` with the `read` group, and
   also exposes the synchronous reader API ai-audit calls directly.
+  Their `rich` modules convert native storage into `MessageRecord`s;
+  opt-in corpus tests compare the rich projection with the flat readers.
 - `crates/udjat-connector-opencode-v1`: `Harness` over HTTP to an
   opencode V1 compatible server (opencode, or a server for pi sessions
   with the `pi` dialect). List filtering is sent to the server as `GET /session`

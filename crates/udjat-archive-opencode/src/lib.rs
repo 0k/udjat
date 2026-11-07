@@ -9,6 +9,7 @@
 
 pub mod db;
 pub mod latency;
+pub mod rich;
 pub mod session_detect;
 pub mod transcript;
 pub use session_detect::{FilterCriterion, SessionFilter};
@@ -76,6 +77,59 @@ pub fn messages_contain_text(messages: &[MessageWithParts], needle: &str) -> boo
 }
 
 impl OpenCodeArchive {
+    pub fn session_row(&self, id: &str) -> Result<Option<udjat_core::SessionRow>> {
+        if !matches!(self.store, Store::LegacyFiles) && db::db_exists() {
+            let row = rich::session_row_from_conn(&db::open_db()?, id)?;
+            if row.is_some() || matches!(self.store, Store::Database) {
+                return Ok(row);
+            }
+        }
+        let sessions = self.list_sessions()?;
+        let Some(session) = sessions.iter().find(|s| s.session_id == id).cloned() else {
+            return Ok(None);
+        };
+        let child_count = sessions
+            .iter()
+            .filter(|s| s.parent_id.as_deref() == Some(id))
+            .count();
+        let messages = self.rich_messages(id)?;
+        Ok(Some(udjat_core::SessionRow::new(
+            session,
+            udjat_core::StructuralStatus::from_messages(&messages, child_count),
+        )))
+    }
+    pub fn rich_messages(&self, id: &str) -> Result<Vec<udjat_core::MessageRecord>> {
+        let database = || rich::rich_messages_from_conn(&db::open_db()?, id);
+        let files = || rich::rich_messages_from_dir(&opencode_data_dir().join("storage"), id);
+        match self.store {
+            Store::Database => database(),
+            Store::LegacyFiles => files(),
+            Store::Merged => {
+                let mut messages = if db::db_exists() {
+                    database()?
+                } else {
+                    Vec::new()
+                };
+                for legacy in files()? {
+                    if let Some(db) = messages.iter_mut().find(|m| m.info.id == legacy.info.id) {
+                        let ids = db
+                            .parts
+                            .iter()
+                            .map(|p| p.id.clone())
+                            .collect::<std::collections::HashSet<_>>();
+                        db.parts
+                            .extend(legacy.parts.into_iter().filter(|p| !ids.contains(&p.id)));
+                    } else {
+                        messages.push(legacy);
+                    }
+                }
+                messages.sort_by(|a, b| {
+                    (a.info.time_created, &a.info.id).cmp(&(b.info.time_created, &b.info.id))
+                });
+                Ok(messages)
+            }
+        }
+    }
     pub fn database_only() -> Self {
         Self {
             store: Store::Database,

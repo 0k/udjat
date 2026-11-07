@@ -130,6 +130,45 @@ pub trait Harness: Send + Sync {
     /// `tokens: None`.
     async fn list_messages(&self, session_id: &str) -> Result<Vec<Message>>;
 
+    /// Rich messages, oldest first; a limit without a cursor selects newest N.
+    async fn messages(
+        &self,
+        _session_id: &str,
+        _page: crate::MessagePage,
+    ) -> Result<crate::MessagePageResult> {
+        Err(Unsupported {
+            harness: self.kind(),
+            capability: Capability::Read,
+        }
+        .into())
+    }
+
+    async fn session_row(&self, _id: &str) -> Result<Option<crate::SessionRow>> {
+        Err(Unsupported {
+            harness: self.kind(),
+            capability: Capability::Read,
+        }
+        .into())
+    }
+
+    async fn list_rows(&self, query: &crate::ListQuery) -> Result<Vec<crate::SessionRow>> {
+        let mut rows = Vec::new();
+        for session in self.list_matching(query).await? {
+            if let Some(row) = self.session_row(&session.session_id).await? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn children(&self, _id: &str) -> Result<Vec<Session>> {
+        Err(Unsupported {
+            harness: self.kind(),
+            capability: Capability::Read,
+        }
+        .into())
+    }
+
     /// `read`: per-assistant-message latencies from harness-native
     /// part-level timing, keyed by `Message.timestamp`.
     ///

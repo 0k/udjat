@@ -134,6 +134,40 @@ async fn real_pi_server_filters_and_lossless_parsing() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     let id = &rows[0].session_id;
+    let rich = Harness::messages(
+        &harness,
+        id,
+        udjat_core::MessagePage {
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rich.messages.len(), 1);
+    assert_eq!(rich.messages[0].info.id, "a1");
+    let rich = Harness::messages(
+        &harness,
+        id,
+        udjat_core::MessagePage {
+            limit: Some(1),
+            before: Some("a1".into()),
+            after: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rich.messages[0].info.id, "u1");
+    assert_eq!(
+        Harness::session_row(&harness, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .session
+            .session_id,
+        *id
+    );
+    assert!(Harness::children(&harness, id).await.unwrap().is_empty());
     assert_eq!(
         serde_json::to_value(harness.transcript(id).await.unwrap()).unwrap(),
         serde_json::to_value(
@@ -210,6 +244,58 @@ async fn real_opencode_server_filters_and_shared_conversion() {
     drop(conn);
     let _server = ready(&mut cmd, &url).await;
     let harness = OpenCodeV1Harness::new(&url, Dialect::OpenCode).unwrap();
+    let rich = Harness::messages(
+        &harness,
+        id,
+        udjat_core::MessagePage {
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rich.messages.len(), 1);
+    assert_eq!(rich.messages[0].info.id, "msg_fixture");
+    let row = Harness::session_row(&harness, id).await.unwrap().unwrap();
+    assert_eq!(row.status.last_message_time_completed, Some(2000));
+    let forward = Harness::messages(
+        &harness,
+        id,
+        udjat_core::MessagePage {
+            limit: Some(1),
+            after: Some(String::new()),
+            before: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(forward.messages.len(), 1);
+    let before = Harness::messages(
+        &harness,
+        id,
+        udjat_core::MessagePage {
+            limit: Some(1),
+            before: Some("msg_fixture".into()),
+            after: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(before.messages.is_empty());
+    assert!(Harness::children(&harness, id).await.unwrap().is_empty());
+    assert_eq!(
+        Harness::list_rows(
+            &harness,
+            &ListQuery {
+                session_id: Some(id.into()),
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
     let q = ListQuery {
         session_id: Some(id.into()),
         content: vec!["hello".into(), "fixture".into()],

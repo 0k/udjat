@@ -14,6 +14,13 @@ fn reads_fixture_through_harness() {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, ID);
             assert_eq!(sessions[0].project_dir, "/fixture");
+            let rich=Harness::messages(&archive,ID,Default::default()).await.unwrap();
+            assert_eq!(rich.messages.len(),1);
+            let row=Harness::session_row(&archive,ID).await.unwrap().unwrap();
+            assert_eq!(row.status.last_message_role.as_deref(),Some("user"));
+            assert!(Harness::session_row(&archive,"ses_missing").await.unwrap().is_none());
+            assert!(Harness::children(&archive,ID).await.unwrap().is_empty());
+            assert_eq!(Harness::list_rows(&archive,&Default::default()).await.unwrap().len(),1);
             let q = udjat_core::ListQuery {
                 session_id: Some(ID.into()), project: Some("/fixture".into()),
                 active: Some((1767225600, 1767225600)), content: vec!["hello".into(), "fixture".into()],
@@ -43,10 +50,10 @@ fn reads_fixture_through_harness() {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(indoc::indoc! {r#"
             PRAGMA journal_mode=WAL;
-            CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+            CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, project_id TEXT);
             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
-            INSERT INTO session VALUES ('ses_fixture', NULL, '/fixture', 'fixture', 1767225600000, 1767225600000);
+            INSERT INTO session VALUES ('ses_fixture', NULL, '/fixture', 'fixture', 1767225600000, 1767225600000, 'project');
             INSERT INTO message VALUES ('msg_fixture', 'ses_fixture', 1767225600000, 1767225600000, '{"id":"msg_fixture","role":"user","time":{"created":1767225600000}}');
             INSERT INTO part VALUES ('part_fixture', 'msg_fixture', 'ses_fixture', 1767225600000, 1767225600000, '{"id":"part_fixture","type":"text","text":"hello fixture"}');
         "#}).unwrap();

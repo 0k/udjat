@@ -7,6 +7,33 @@ use udjat_core::{
 
 #[async_trait::async_trait]
 impl Harness for ClaudeCodeArchive {
+    async fn messages(
+        &self,
+        id: &str,
+        page: udjat_core::MessagePage,
+    ) -> Result<udjat_core::MessagePageResult> {
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            udjat_core::MessagePageResult::from_messages(Self.rich_messages(&id)?, page)
+        })
+        .await?
+    }
+    async fn session_row(&self, id: &str) -> Result<Option<udjat_core::SessionRow>> {
+        let sessions = Harness::list_sessions(self).await?;
+        let Some(session) = sessions.iter().find(|s| s.session_id == id).cloned() else {
+            return Ok(None);
+        };
+        let messages = Harness::messages(self, id, Default::default())
+            .await?
+            .messages;
+        Ok(Some(udjat_core::SessionRow::new(
+            session,
+            udjat_core::StructuralStatus::from_messages(&messages, 0),
+        )))
+    }
+    async fn children(&self, _id: &str) -> Result<Vec<Session>> {
+        Ok(Vec::new())
+    }
     fn kind(&self) -> HarnessKind {
         HarnessKind::ClaudeCode
     }

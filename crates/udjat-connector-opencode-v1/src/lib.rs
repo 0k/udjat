@@ -125,11 +125,20 @@ impl OpenCodeV1Harness {
         url.path_segments_mut()
             .map_err(|()| anyhow::anyhow!("invalid base URL"))?
             .pop_if_empty()
-            .extend(["session", id, endpoint]);
+            .extend(["session", id]);
+        if !endpoint.is_empty() {
+            url.path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("invalid base URL"))?
+                .push(endpoint);
+        }
         Ok(url)
     }
 
-    async fn messages(&self, id: &str, limit: Option<usize>) -> Result<Vec<MessageWithParts>> {
+    async fn native_messages(
+        &self,
+        id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<MessageWithParts>> {
         let mut url = self.session_url(id, "message")?;
         if let Some(limit) = limit {
             url.query_pairs_mut()
@@ -182,6 +191,82 @@ fn timestamp(ms: f64) -> Result<DateTime<Utc>> {
 
 #[async_trait::async_trait]
 impl Harness for OpenCodeV1Harness {
+    async fn messages(
+        &self,
+        id: &str,
+        page: udjat_core::MessagePage,
+    ) -> Result<udjat_core::MessagePageResult> {
+        if self.dialect == Dialect::Pi {
+            return udjat_core::MessagePageResult::from_messages(
+                udjat_archive_pi::rich::from_jsonl(&self.raw(id).await?, id)?,
+                page,
+            );
+        }
+        anyhow::ensure!(
+            page.before.is_none() || page.after.is_none(),
+            "before and after are mutually exclusive"
+        );
+        let mut url = self.session_url(id, "message")?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(limit) = page.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(before) = &page.before {
+                query.append_pair("before", before);
+            }
+            if let Some(after) = &page.after {
+                query.append_pair("after", after);
+            }
+        }
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        let cursor = response
+            .headers()
+            .get("x-next-cursor")
+            .map(|v| v.to_str().map(str::to_owned))
+            .transpose()?;
+        let messages = response
+            .json::<Vec<serde_json::Value>>()
+            .await?
+            .into_iter()
+            .map(udjat_core::from_opencode_v1)
+            .collect();
+        Ok(udjat_core::MessagePageResult {
+            messages,
+            next_before: if page.after.is_none() {
+                cursor.clone()
+            } else {
+                None
+            },
+            next_after: if page.after.is_some() { cursor } else { None },
+        })
+    }
+    async fn session_row(&self, id: &str) -> Result<Option<udjat_core::SessionRow>> {
+        let response = self.client.get(self.session_url(id, "")?).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let value = response
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        let mut row = udjat_core::from_opencode_v1_row(value, self.kind())?;
+        if self.dialect == Dialect::Pi {
+            let messages = Harness::messages(self, id, Default::default())
+                .await?
+                .messages;
+            row.status =
+                udjat_core::StructuralStatus::from_messages(&messages, row.status.child_count);
+        }
+        Ok(Some(row))
+    }
+    async fn children(&self, id: &str) -> Result<Vec<Session>> {
+        self.list_matching(&ListQuery {
+            parent: Some(id.into()),
+            ..Default::default()
+        })
+        .await
+    }
     fn kind(&self) -> HarnessKind {
         match self.dialect {
             Dialect::OpenCode => HarnessKind::OpenCode,
@@ -256,7 +341,7 @@ impl Harness for OpenCodeV1Harness {
         }
         match self.dialect {
             Dialect::OpenCode => Ok(udjat_archive_opencode::messages_contain_text(
-                &self.messages(id, Some(last_n)).await?,
+                &self.native_messages(id, Some(last_n)).await?,
                 needle,
             )),
             Dialect::Pi => Ok(udjat_archive_pi::session::jsonl_tail_contains_text(
@@ -269,7 +354,7 @@ impl Harness for OpenCodeV1Harness {
     async fn transcript(&self, id: &str) -> Result<Vec<TranscriptEntry>> {
         match self.dialect {
             Dialect::OpenCode => {
-                let messages = self.messages(id, None).await?;
+                let messages = self.native_messages(id, None).await?;
                 anyhow::ensure!(
                     !messages.is_empty(),
                     "OpenCode session has no messages: {}",
@@ -285,7 +370,7 @@ impl Harness for OpenCodeV1Harness {
     async fn list_messages(&self, id: &str) -> Result<Vec<Message>> {
         match self.dialect {
             Dialect::OpenCode => Ok(udjat_archive_opencode::messages_from_json(
-                &self.messages(id, None).await?,
+                &self.native_messages(id, None).await?,
                 id,
             )),
             Dialect::Pi => udjat_archive_pi::session::parse_messages(&self.raw(id).await?, id),
@@ -306,7 +391,7 @@ impl Harness for OpenCodeV1Harness {
         match self.dialect {
             Dialect::OpenCode => Ok(
                 udjat_archive_opencode::latency::message_part_latencies_from_messages(
-                    &self.messages(id, None).await?,
+                    &self.native_messages(id, None).await?,
                 ),
             ),
             Dialect::Pi => Ok(Default::default()),

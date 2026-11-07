@@ -7,6 +7,41 @@ use udjat_core::{
 
 #[async_trait::async_trait]
 impl Harness for PiArchive {
+    async fn messages(
+        &self,
+        id: &str,
+        page: udjat_core::MessagePage,
+    ) -> Result<udjat_core::MessagePageResult> {
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            udjat_core::MessagePageResult::from_messages(Self.rich_messages(&id)?, page)
+        })
+        .await?
+    }
+    async fn session_row(&self, id: &str) -> Result<Option<udjat_core::SessionRow>> {
+        let sessions = Harness::list_sessions(self).await?;
+        let Some(session) = sessions.iter().find(|s| s.session_id == id).cloned() else {
+            return Ok(None);
+        };
+        let count = sessions
+            .iter()
+            .filter(|s| s.parent_id.as_deref() == Some(id))
+            .count();
+        let messages = Harness::messages(self, id, Default::default())
+            .await?
+            .messages;
+        Ok(Some(udjat_core::SessionRow::new(
+            session,
+            udjat_core::StructuralStatus::from_messages(&messages, count),
+        )))
+    }
+    async fn children(&self, id: &str) -> Result<Vec<Session>> {
+        Ok(Harness::list_sessions(self)
+            .await?
+            .into_iter()
+            .filter(|s| s.parent_id.as_deref() == Some(id))
+            .collect())
+    }
     fn kind(&self) -> HarnessKind {
         HarnessKind::Pi
     }

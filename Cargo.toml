@@ -16,7 +16,7 @@ colored = "3"
 kal-log = "0.1"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 anyhow = "1"
@@ -26,7 +26,7 @@ udjat-archive-claude-code = { path = "crates/udjat-archive-claude-code", version
 udjat-archive-opencode = { path = "crates/udjat-archive-opencode", version = "0.1.0" }
 udjat-archive-pi = { path = "crates/udjat-archive-pi", version = "0.1.0" }
 dirs = "5"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 indoc = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures = "0.3"

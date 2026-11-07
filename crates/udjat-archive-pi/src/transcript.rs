@@ -25,7 +25,7 @@ pub fn parse_transcript(session_id: &str) -> Result<Vec<TranscriptEntry>> {
     parse_transcript_from_file(&path)
 }
 
-fn parse_transcript_from_file(path: &std::path::Path) -> Result<Vec<TranscriptEntry>> {
+pub fn parse_transcript_from_file(path: &std::path::Path) -> Result<Vec<TranscriptEntry>> {
     let file = fs::File::open(path)
         .with_context(|| format!("Failed to open session file: {}", path.display()))?;
     let reader = BufReader::new(file);

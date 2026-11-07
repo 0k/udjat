@@ -78,51 +78,14 @@ pub fn parse_transcript_from_conn(
 pub fn parse_transcript_from_messages(
     messages: &[crate::MessageWithParts],
 ) -> Vec<TranscriptEntry> {
-    let mut entries = Vec::new();
-    for message in messages {
-        let data = &message.info;
-        let role = match data
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-        {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            "system" => Role::System,
-            _ => continue,
-        };
-
-        let time_created_ms = data
-            .get("time")
-            .and_then(|t| t.get("created"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let msg_timestamp = Utc
-            .timestamp_millis_opt(time_created_ms)
-            .single()
-            .unwrap_or_else(Utc::now);
-
-        // Check for message-level error (e.g. API validation errors)
-        if let Some(error) = data.get("error") {
-            if let Some(msg) = extract_error_message(error) {
-                entries.push(TranscriptEntry {
-                    timestamp: msg_timestamp,
-                    role: role.clone(),
-                    entry_type: EntryType::Error,
-                    content: msg,
-                    tool_name: None,
-                    tool_input: None,
-                });
-            }
-        }
-
-        for part in &message.parts {
-            entries_from_part(part, &role, msg_timestamp, &mut entries);
-        }
-    }
-
-    entries.sort_by_key(|e| e.timestamp);
-    entries
+    udjat_core::transcript_entries(
+        &messages
+            .iter()
+            .map(|m| {
+                udjat_core::from_opencode_v1(serde_json::json!({"info":m.info,"parts":m.parts}))
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Extract an error message from a message-level `"error"` field.

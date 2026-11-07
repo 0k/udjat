@@ -4,6 +4,7 @@
 #![allow(clippy::collapsible_if, clippy::filter_next)]
 
 mod harness;
+pub mod rich;
 pub mod session;
 #[cfg(test)]
 mod tests;
@@ -38,6 +39,9 @@ pub fn sessions_dir() -> PathBuf {
 pub struct PiArchive;
 
 impl PiArchive {
+    pub fn rich_messages(&self, session_id: &str) -> Result<Vec<udjat_core::MessageRecord>> {
+        rich::rich_messages(session_id)
+    }
     pub fn provider(&self) -> Provider {
         Provider::Pi
     }

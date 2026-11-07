@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod attribution_tests;
 mod harness;
+pub mod rich;
 pub mod session;
 pub mod transcript;
 
@@ -37,6 +38,9 @@ pub fn resolve_debug_file(session_id: &str) -> PathBuf {
 pub struct ClaudeCodeArchive;
 
 impl ClaudeCodeArchive {
+    pub fn rich_messages(&self, session_id: &str) -> Result<Vec<udjat_core::MessageRecord>> {
+        rich::rich_messages(session_id)
+    }
     pub fn provider(&self) -> Provider {
         Provider::ClaudeCode
     }

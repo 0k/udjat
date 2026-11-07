@@ -7,6 +7,30 @@ use udjat_core::{
 
 #[async_trait::async_trait]
 impl Harness for OpenCodeArchive {
+    async fn messages(
+        &self,
+        id: &str,
+        page: udjat_core::MessagePage,
+    ) -> Result<udjat_core::MessagePageResult> {
+        let archive = *self;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            udjat_core::MessagePageResult::from_messages(archive.rich_messages(&id)?, page)
+        })
+        .await?
+    }
+    async fn session_row(&self, id: &str) -> Result<Option<udjat_core::SessionRow>> {
+        let archive = *self;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || archive.session_row(&id)).await?
+    }
+    async fn children(&self, id: &str) -> Result<Vec<Session>> {
+        Ok(Harness::list_sessions(self)
+            .await?
+            .into_iter()
+            .filter(|s| s.parent_id.as_deref() == Some(id))
+            .collect())
+    }
     fn kind(&self) -> HarnessKind {
         HarnessKind::OpenCode
     }
